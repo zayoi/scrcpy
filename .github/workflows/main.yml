@@ -2,49 +2,199 @@ name: Build scrcpy (Win64 + Android Server)
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
-  workflow_dispatch:  # 允许手动触发
+    branches: ["main", "master"]
+  workflow_dispatch: # 允许手动触发
+    inputs:
+      version:
+        description: 'Custom version tag'
+        required: false
+        default: ''
+
+env:
+  BUILD_VERSION: v${{ github.event.inputs.version || github.ref_name }}
 
 jobs:
+  setup:
+    name: Prepare Build Environment
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get-tag.outputs.tag }}
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Get version tag
+        id: get-tag
+        run: |
+          if [ -f "meson.build" ]; then
+            VERSION=$(grep -m1 "version:" meson.build | cut -d"'" -f2)
+            echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
   build-server:
-    name: Build Android Server (scrcpy-server.jar)
+    name: Build Android Server
+    needs: setup
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout with submodules
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Build Server JAR
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Build Server
         run: |
-          # 使用官方脚本构建 server
-          ./release/build_server.sh
+          # 确保在项目根目录执行
+          cd server
+          ./build.sh
+          ls -la build
 
       - name: Upload Server Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: scrcpy-server
-          path: |
-            build-server/scrcpy-server.jar
+          name: scrcpy-server-${{ needs.setup.outputs.tag }}
+          path: server/build/libs/scrcpy-server.jar
           retention-days: 7
 
   build-win64:
     name: Build Windows 64-bit Client
+    needs: setup
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout with submodules
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Build Win64 Client
+      - name: Install dependencies
         run: |
-          # 调用官方脚本进行 MinGW 交叉编译
-          bash ./release/build_windows.sh 64
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            mingw-w64 \
+            ccache \
+            pkg-config \
+            libsdl2-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev
+
+      - name: Build for Windows
+        run: |
+          # 创建交叉编译文件
+          cat > cross_win64.txt <<EOF
+          [binaries]
+          c = 'x86_64-w64-mingw32-gcc'
+          cpp = 'x86_64-w64-mingw32-g++'
+          ar = 'x86_64-w64-mingw32-ar'
+          strip = 'x86_64-w64-mingw32-strip'
+          windres = 'x86_64-w64-mingw32-windres'
+          pkgconfig = 'x86_64-w64-mingw32-pkg-config'
+          
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+          # 创建构建目录
+          mkdir -p build-win64
+          cd build-win64
+          
+          # 配置 Meson
+          meson setup .. \
+            --cross-file ../cross_win64.txt \
+            --buildtype release \
+            --strip \
+            -Dcompile_app=false \
+            -Dcrossbuild_windows=true \
+            -Dprebuilt_server=../server/build/libs/scrcpy-server.jar
+          
+          # 编译
+          ninja
+          
+          # 验证输出
+          ls -la
+          file scrcpy.exe || echo "scrcpy.exe not found"
+
+      - name: Prepare Windows Distribution
+        run: |
+          mkdir -p dist/win64
+          
+          # 复制可执行文件
+          cp build-win64/scrcpy.exe dist/win64/
+          
+          # 复制必要的 DLL
+          cp /usr/x86_64-w64-mingw32/lib/*.dll dist/win64/ 2>/dev/null || true
+          
+          # 复制 SDL2 DLL
+          find /usr -name "SDL2.dll" -type f 2>/dev/null | head -1 | xargs -I {} cp {} dist/win64/ 2>/dev/null || echo "SDL2.dll not found"
+          
+          # 复制 FFmpeg DLL
+          for lib in avcodec avformat avutil swresample; do
+            find /usr -name "lib${lib}-*.dll" -type f 2>/dev/null | head -1 | xargs -I {} cp {} dist/win64/ 2>/dev/null || echo "lib${lib}.dll not found"
+          done
+          
+          # 复制 Server
+          cp server/build/libs/scrcpy-server.jar dist/win64/
+          
+          # 列出文件
+          ls -la dist/win64/
 
       - name: Upload Win64 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: scrcpy-win64
-          path: |
-            build-win64/dist/
-            build-win64/scrcpy.exe
+          name: scrcpy-win64-${{ needs.setup.outputs.tag }}
+          path: dist/win64/
           retention-days: 7
+
+  release-prepare:
+    name: Create Release Package
+    needs: [build-server, build-win64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create ZIP package
+        run: |
+          mkdir -p release
+          cd artifacts
+          
+          # 找到最新的 artifacts
+          SERVER_JAR=$(find . -name "*.jar" -type f | head -1)
+          WIN64_DIR=$(find . -name "scrcpy-win64-*" -type d | head -1)
+          
+          # 合并文件
+          mkdir -p scrcpy-${{ needs.setup.outputs.tag }}-win64
+          cp "$WIN64_DIR"/* scrcpy-${{ needs.setup.outputs.tag }}-win64/ 2>/dev/null || true
+          cp "$SERVER_JAR" scrcpy-${{ needs.setup.outputs.tag }}-win64/scrcpy-server.jar
+          
+          # 创建 ZIP
+          zip -r ../release/scrcpy-${{ needs.setup.outputs.tag }}-win64.zip scrcpy-${{ needs.setup.outputs.tag }}-win64/
+          
+          ls -la ../release
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
